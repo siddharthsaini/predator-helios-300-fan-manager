@@ -1,4 +1,4 @@
-# Predator Fan Manager
+# Predator Helios 300 Fan Manager (for PH315-51)
 
 A small Ubuntu/GNOME top-bar fan manager for the **Acer Predator Helios 300
 PH315-51** (2018, i7-8750H + GTX 1060). It mirrors the fan controls of Acer
