@@ -13,6 +13,11 @@ PredatorSense:
 The default sensor thresholds are green below 70°C, yellow from 70°C to below
 85°C, and red at 85°C or above.
 
+## Screenshot
+
+![utility running](utility.png)
+![minified top bar icon](top-bar.png)
+
 ## Important hardware warning
 
 This project targets one exact machine. It uses the Acer BIOS
