@@ -1,0 +1,73 @@
+#!/usr/bin/python3
+"""Read-only hardware probe for Predator Fan Manager (PH315-51).
+
+Run with sudo. Loads acpi_call/ec_sys if needed, then reads temps, RPM, fan
+modes and CoolBoost. It never changes fan modes or writes to the EC.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import core  # noqa: E402
+
+
+def main():
+    if os.geteuid() != 0:
+        print("Run this probe with sudo so it can access /proc/acpi/call.", file=sys.stderr)
+        return 1
+
+    product = core.read_text("/sys/class/dmi/id/product_name", "unknown")
+    vendor = core.read_text("/sys/class/dmi/id/sys_vendor", "unknown")
+    bios = core.read_text("/sys/class/dmi/id/bios_version", "unknown")
+    print(f"Model:    {vendor} {product}")
+    print(f"BIOS:     {bios}")
+    print(f"Supported target: {'yes' if core.model_supported() else 'NO (PH315-51 required)'}")
+    print()
+
+    if core.model_supported():
+        for message in core.ensure_modules():
+            print(f"module:   {message}")
+    else:
+        print("module:   skipped (unsupported model)")
+    print(f"acpi_call: {'available' if os.path.exists(core.ACPI_CALL) else 'unavailable'}")
+    print(f"EC:        {'available' if os.path.exists(core.EC_IO) else 'unavailable'}")
+    print()
+
+    if core.WmiBackend.available():
+        wmi = core.WmiBackend()
+        if wmi.probe():
+            sensors = wmi.read_sensors()
+            print("WMI read test: OK")
+            print(f"  CPU temp: {sensors.get('cpu_temp')} °C")
+            print(f"  GPU temp: {sensors.get('gpu_temp')} °C")
+            print(f"  CPU RPM:  {sensors.get('cpu_rpm')}")
+            print(f"  GPU RPM:  {sensors.get('gpu_rpm')}")
+        else:
+            print("WMI read test: FAILED")
+            print("  Check that the BIOS exposes \\_SB.PCI0.WMID.WMBH and that")
+            print("  acpi_call is loaded. No hardware was written.")
+    else:
+        print("WMI read test: skipped (acpi_call unavailable)")
+    print()
+
+    if core.EcBackend.available():
+        ec = core.EcBackend()
+        try:
+            print("EC fan modes:", ec.get_fans())
+            print("EC CoolBoost:", ec.get_coolboost())
+        except (core.HardwareError, OSError) as exc:
+            print(f"EC read failed: {exc}")
+    else:
+        print("EC read test: skipped")
+
+    print()
+    print("No fan modes, CPU settings, or EC values were changed.")
+    return 0 if core.model_supported() else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

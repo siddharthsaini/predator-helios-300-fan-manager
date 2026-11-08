@@ -1,0 +1,527 @@
+#!/usr/bin/python3
+"""Predator Fan Manager — top-bar fan control for the PH315-51."""
+
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import socket
+import sys
+import threading
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+
+import gi  # noqa: E402
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("AyatanaAppIndicator3", "0.1")
+from gi.repository import AyatanaAppIndicator3 as AppIndicator  # noqa: E402
+from gi.repository import GLib, Gtk  # noqa: E402
+
+import core  # noqa: E402
+
+ICON_COLORS = {
+    "green": "#2ecc71",
+    "yellow": "#f1c40f",
+    "red": "#e74c3c",
+    "grey": "#7f8c8d",
+}
+
+FAN_SVG = """\
+<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24">
+  <circle cx="12" cy="12" r="11" fill="{color}"/>
+  <g fill="#ffffff">
+    <circle cx="12" cy="12" r="2.1"/>
+    <path d="M12 9.4C11.7 6.2 12.8 3.8 15.2 3.8c1.5 0 2.4 1.0 2.4 2.3 0 2.1-1.7 3.6-4.6 4.3Z"/>
+    <path d="M12 9.4C11.7 6.2 12.8 3.8 15.2 3.8c1.5 0 2.4 1.0 2.4 2.3 0 2.1-1.7 3.6-4.6 4.3Z" transform="rotate(120 12 12)"/>
+    <path d="M12 9.4C11.7 6.2 12.8 3.8 15.2 3.8c1.5 0 2.4 1.0 2.4 2.3 0 2.1-1.7 3.6-4.6 4.3Z" transform="rotate(240 12 12)"/>
+  </g>
+</svg>
+"""
+
+MODE_LABELS = {"auto": "Auto", "max": "Max", "custom": "Custom"}
+
+
+def make_icons():
+    directory = os.path.join(GLib.get_user_cache_dir(), "predator-fan-manager")
+    os.makedirs(directory, exist_ok=True)
+    paths = {}
+    for name, color in ICON_COLORS.items():
+        path = os.path.join(directory, f"predator-fan-{name}.svg")
+        content = FAN_SVG.format(color=color)
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                old = handle.read()
+        except OSError:
+            old = None
+        if old != content:
+            try:
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write(content)
+            except OSError:
+                pass
+        paths[name] = path
+    return paths
+
+
+def acquire_instance_lock():
+    directory = os.path.join(GLib.get_user_cache_dir(), "predator-fan-manager")
+    os.makedirs(directory, exist_ok=True)
+    handle = open(os.path.join(directory, "instance.lock"), "w", encoding="ascii")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    handle.write(str(os.getpid()))
+    handle.flush()
+    return handle
+
+
+class HelperClient:
+    def __init__(self, socket_path, on_status, on_link):
+        self.socket_path = socket_path
+        self.on_status = on_status
+        self.on_link = on_link
+        self.state = None
+        self.sock = None
+        self.lock = threading.Lock()
+        self.running = False
+        self.thread = None
+
+    def start(self):
+        self.running = True
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.running = False
+        with self.lock:
+            sock = self.sock
+            self.sock = None
+        if sock:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def apply_state(self, state):
+        self.state = state
+        line = json.dumps({"cmd": "state", "state": state}) + "\n"
+        with self.lock:
+            if self.sock:
+                try:
+                    self.sock.sendall(line.encode("utf-8"))
+                except OSError:
+                    pass
+
+    def _post(self, callback, *args):
+        GLib.idle_add(callback, *args)
+
+    def _run(self):
+        while self.running:
+            sock = None
+            try:
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                sock.settimeout(3.0)
+                sock.connect(self.socket_path)
+                sock.settimeout(None)
+                with self.lock:
+                    self.sock = sock
+                    if self.state is not None:
+                        payload = json.dumps({"cmd": "state", "state": self.state})
+                        sock.sendall((payload + "\n").encode("utf-8"))
+                self._post(self.on_link, True)
+
+                buffer = b""
+                while self.running:
+                    data = sock.recv(65536)
+                    if not data:
+                        break
+                    buffer += data
+                    while b"\n" in buffer:
+                        line, buffer = buffer.split(b"\n", 1)
+                        if not line.strip():
+                            continue
+                        try:
+                            message = json.loads(line)
+                        except (ValueError, TypeError):
+                            continue
+                        self._post(self.on_status, message)
+            except OSError:
+                pass
+            finally:
+                with self.lock:
+                    if self.sock is sock:
+                        self.sock = None
+                if sock:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+                self._post(self.on_link, False)
+            if self.running:
+                time.sleep(2.0)
+
+
+class FanApp:
+    def __init__(self, show_window=False):
+        self.config = core.load_config()
+        self.status = {}
+        self.connected = False
+        self.updating = False
+        self.icons = make_icons()
+
+        self._build_indicator()
+        self._build_menu()
+        self._build_window()
+
+        self.client = HelperClient(core.SOCKET_PATH, self._on_status, self._on_link)
+        self.client.apply_state(core.control_state(self.config))
+        self._update_controls()
+        self._update_display()
+        self.client.start()
+
+        if show_window:
+            self.show_window()
+
+    # ---- UI construction ---------------------------------------------
+    def _build_indicator(self):
+        self.indicator = AppIndicator.Indicator.new(
+            "predator-fan-manager",
+            self.icons["grey"],
+            AppIndicator.IndicatorCategory.HARDWARE,
+        )
+        self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+        self.indicator.set_title("Predator Fan Manager")
+        self.indicator.set_label("–", "CPU and GPU temperature")
+
+    def _build_menu(self):
+        self.menu = Gtk.Menu()
+        self.menu_header = Gtk.MenuItem(label="Helper unavailable")
+        self.menu_header.set_sensitive(False)
+        self.menu.append(self.menu_header)
+        self.menu.append(Gtk.SeparatorMenuItem())
+
+        self.fan_menu_items = {}
+        for fan, title in (("cpu", "CPU fan"), ("gpu", "GPU fan")):
+            submenu = Gtk.Menu()
+            group = None
+            items = {}
+            for mode in core.MODES:
+                if group is None:
+                    item = Gtk.RadioMenuItem.new_with_label(None, MODE_LABELS[mode])
+                    group = item
+                else:
+                    item = Gtk.RadioMenuItem.new_with_label_from_widget(
+                        group, MODE_LABELS[mode]
+                    )
+                item.connect("toggled", self._on_menu_fan_mode, fan, mode)
+                submenu.append(item)
+                items[mode] = item
+            fan_item = Gtk.MenuItem(label=title)
+            fan_item.set_submenu(submenu)
+            self.menu.append(fan_item)
+            self.fan_menu_items[fan] = items
+
+        self.coolboost_item = Gtk.CheckMenuItem(label="CoolBoost")
+        self.coolboost_item.connect("toggled", self._on_menu_coolboost)
+        self.menu.append(self.coolboost_item)
+
+        self.menu.append(Gtk.SeparatorMenuItem())
+        settings = Gtk.MenuItem(label="Settings…")
+        settings.connect("activate", self.show_window)
+        self.menu.append(settings)
+        quit_item = Gtk.MenuItem(label="Quit")
+        quit_item.connect("activate", self.quit)
+        self.menu.append(quit_item)
+        self.menu.show_all()
+        self.indicator.set_menu(self.menu)
+
+    def _build_window(self):
+        self.window = Gtk.Window(title="Predator Fan Manager")
+        self.window.set_default_size(540, -1)
+        self.window.set_border_width(16)
+        self.window.connect("delete-event", self._hide_window)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        self.window.add(outer)
+
+        title = Gtk.Label()
+        title.set_markup("<b>Predator Fan Manager</b>")
+        title.set_xalign(0)
+        outer.pack_start(title, False, False, 0)
+
+        subtitle = Gtk.Label(label="Acer Predator Helios 300 PH315-51")
+        subtitle.set_xalign(0)
+        subtitle.get_style_context().add_class("dim-label")
+        outer.pack_start(subtitle, False, False, 0)
+
+        self.status_label = Gtk.Label()
+        self.status_label.set_xalign(0)
+        self.status_label.set_line_wrap(True)
+        outer.pack_start(self.status_label, False, False, 0)
+
+        outer.pack_start(Gtk.Separator(), False, False, 4)
+
+        self.fan_widgets = {}
+        for fan, title_text in (("cpu", "CPU fan"), ("gpu", "GPU fan")):
+            frame = Gtk.Frame(label=title_text)
+            inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            inner.set_border_width(10)
+            frame.add(inner)
+
+            combo = Gtk.ComboBoxText()
+            for mode in core.MODES:
+                combo.append(mode, MODE_LABELS[mode])
+            combo.connect("changed", self._on_fan_mode_changed, fan)
+            inner.pack_start(self._row("Mode", combo), False, False, 0)
+
+            scale = Gtk.Scale.new_with_range(
+                Gtk.Orientation.HORIZONTAL, 0, 100, 1
+            )
+            scale.set_digits(0)
+            scale.set_draw_value(True)
+            scale.set_value_pos(Gtk.PositionType.RIGHT)
+            scale.set_hexpand(True)
+            scale.connect("value-changed", self._on_fan_percent_changed, fan)
+            scale_row = self._row("Custom speed (%)", scale)
+            inner.pack_start(scale_row, False, False, 0)
+
+            note = Gtk.Label(label="Custom 0% may stop the fan. Use with care.")
+            note.set_xalign(0)
+            note.get_style_context().add_class("dim-label")
+            inner.pack_start(note, False, False, 0)
+
+            outer.pack_start(frame, False, False, 0)
+            self.fan_widgets[fan] = {
+                "combo": combo,
+                "scale": scale,
+                "scale_row": scale_row,
+            }
+
+        self.coolboost_check = Gtk.CheckButton(label="CoolBoost")
+        self.coolboost_check.connect("toggled", self._on_coolboost_check)
+        outer.pack_start(self.coolboost_check, False, False, 0)
+
+        self.show_check = Gtk.CheckButton(label="Show temperature in the top bar")
+        self.show_check.connect("toggled", self._on_show_temp)
+        outer.pack_start(self.show_check, False, False, 0)
+
+        safety = Gtk.Label(
+            label=(
+                "On quit, disconnect, or helper exit the fans return to BIOS Auto "
+                "and CoolBoost is turned off. Changes apply immediately."
+            )
+        )
+        safety.set_xalign(0)
+        safety.set_line_wrap(True)
+        safety.get_style_context().add_class("dim-label")
+        outer.pack_start(safety, False, False, 0)
+
+        self.details_label = Gtk.Label()
+        self.details_label.set_xalign(0)
+        self.details_label.set_line_wrap(True)
+        self.details_label.set_selectable(True)
+        outer.pack_start(self.details_label, False, False, 0)
+
+        close = Gtk.Button(label="Close")
+        close.connect("clicked", lambda _button: self.window.hide())
+        outer.pack_end(close, False, False, 4)
+
+    @staticmethod
+    def _row(label_text, widget):
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        label = Gtk.Label(label=label_text)
+        label.set_xalign(0)
+        label.set_size_request(145, -1)
+        row.pack_start(label, False, False, 0)
+        row.pack_start(widget, True, True, 0)
+        return row
+
+    # ---- configuration ------------------------------------------------
+    def _push_config(self):
+        self.config = core.normalize_config(self.config)
+        try:
+            core.save_config(self.config)
+        except OSError as exc:
+            print(f"Could not save config: {exc}", file=sys.stderr)
+        self.client.apply_state(core.control_state(self.config))
+        self._update_controls()
+        self._update_display()
+
+    def _set_fan(self, fan, **changes):
+        self.config["fans"][fan].update(changes)
+        self._push_config()
+
+    def _on_fan_mode_changed(self, combo, fan):
+        if self.updating:
+            return
+        mode = combo.get_active_id()
+        if mode:
+            self._set_fan(fan, mode=mode)
+
+    def _on_fan_percent_changed(self, scale, fan):
+        if self.updating:
+            return
+        self._set_fan(fan, percent=int(scale.get_value()))
+
+    def _on_menu_fan_mode(self, item, fan, mode):
+        if self.updating or not item.get_active():
+            return
+        self._set_fan(fan, mode=mode)
+
+    def _on_coolboost_check(self, check):
+        if self.updating:
+            return
+        self.config["coolboost"] = check.get_active()
+        self._push_config()
+
+    def _on_menu_coolboost(self, item):
+        if self.updating:
+            return
+        self.config["coolboost"] = item.get_active()
+        self._push_config()
+
+    def _on_show_temp(self, check):
+        if self.updating:
+            return
+        self.config["show_temp"] = check.get_active()
+        self._push_config()
+
+    def _update_controls(self):
+        self.updating = True
+        try:
+            for fan in core.FANS:
+                widgets = self.fan_widgets[fan]
+                fan_config = self.config["fans"][fan]
+                widgets["combo"].set_active_id(fan_config["mode"])
+                widgets["scale"].set_value(fan_config["percent"])
+                widgets["scale_row"].set_sensitive(fan_config["mode"] == "custom")
+                for mode, item in self.fan_menu_items[fan].items():
+                    item.set_active(mode == fan_config["mode"])
+            self.coolboost_check.set_active(self.config["coolboost"])
+            self.coolboost_item.set_active(self.config["coolboost"])
+            self.show_check.set_active(self.config["show_temp"])
+        finally:
+            self.updating = False
+
+    # ---- status -------------------------------------------------------
+    def _on_link(self, connected):
+        self.connected = bool(connected)
+        if not connected:
+            self.status = {}
+        self._update_display()
+        return False
+
+    def _on_status(self, message):
+        if isinstance(message, dict) and message.get("type") == "status":
+            self.status = message
+            self.connected = True
+            self._update_display()
+        return False
+
+    def _fan_summary(self):
+        parts = []
+        for fan in core.FANS:
+            config = self.config["fans"][fan]
+            label = MODE_LABELS.get(config["mode"], config["mode"])
+            if config["mode"] == "custom":
+                label += f" {config['percent']}%"
+            parts.append(f"{fan.upper()} {label}")
+        return " · ".join(parts)
+
+    def _header_text(self):
+        if not self.connected:
+            return "Helper unavailable"
+        fault = self.status.get("fault")
+        if fault:
+            return f"Error: {fault}"
+        temps = self.status.get("temps") or {}
+        rpm = self.status.get("rpm") or {}
+        cpu = temps.get("cpu")
+        gpu = temps.get("gpu")
+        if cpu is None and gpu is None:
+            return "Waiting for sensors…"
+        temp_text = []
+        if cpu is not None:
+            temp_text.append(f"CPU {cpu:.0f}°C")
+        if gpu is not None:
+            temp_text.append(f"GPU {gpu:.0f}°C")
+        rpm_text = []
+        if rpm.get("cpu") is not None:
+            rpm_text.append(f"{rpm['cpu']} RPM")
+        if rpm.get("gpu") is not None:
+            rpm_text.append(f"{rpm['gpu']} RPM")
+        suffix = f" · {' / '.join(rpm_text)}" if rpm_text else ""
+        return f"{' · '.join(temp_text)}{suffix}"
+
+    def _update_display(self):
+        if not hasattr(self, "indicator"):
+            return
+        temps = self.status.get("temps") or {}
+        cpu = temps.get("cpu")
+        gpu = temps.get("gpu")
+        hottest = core.hottest(cpu, gpu)
+        color = core.temp_color(hottest) if self.connected else "grey"
+        self.indicator.set_icon_full(self.icons[color], f"Predator fan {color}")
+        if self.config["show_temp"] and self.connected and hottest is not None:
+            self.indicator.set_label(f"{hottest:.0f}°", self._header_text())
+        else:
+            self.indicator.set_label("", "")
+
+        header = self._header_text()
+        self.menu_header.set_label(f"{header}\n{self._fan_summary()}")
+        self.details_label.set_text(
+            f"Backend: {self.status.get('backend') or '—'}\n"
+            f"Fans: {self._fan_summary()}\n"
+            f"Live: {header}"
+        )
+
+        if self.connected:
+            fault = self.status.get("fault")
+            if fault:
+                self.status_label.set_text(f"Error: {fault}")
+            else:
+                capabilities = self.status.get("capabilities") or {}
+                extra = " · CoolBoost available" if capabilities.get("coolboost") else ""
+                self.status_label.set_text(
+                    f"{header} · backend {self.status.get('backend') or '—'}{extra}"
+                )
+                self.coolboost_check.set_sensitive(bool(capabilities.get("coolboost", True)))
+                self.coolboost_item.set_sensitive(bool(capabilities.get("coolboost", True)))
+        else:
+            self.status_label.set_text("Helper unavailable — hardware controls disabled")
+
+    def show_window(self, *_args):
+        self.window.show_all()
+        self.window.present()
+
+    def _hide_window(self, *_args):
+        self.window.hide()
+        return True
+
+    def quit(self, *_args):
+        self.client.stop()
+        Gtk.main_quit()
+
+
+def main():
+    lock = acquire_instance_lock()
+    if lock is None:
+        print("Predator Fan Manager is already running.", file=sys.stderr)
+        return 0
+    app = FanApp(show_window="--show" in sys.argv[1:])
+    Gtk.main()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,351 @@
+#!/usr/bin/python3
+"""Privileged helper for Predator Fan Manager.
+
+The helper is the only process that touches the fan hardware. It listens on a
+local Unix socket, applies validated CPU/GPU fan settings, broadcasts sensor
+readings, and restores firmware auto mode when the GUI disconnects or it exits.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pwd
+import select
+import signal
+import socket
+import stat
+import struct
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import core  # noqa: E402
+
+
+def log(message):
+    print(f"predator-fan-helper: {message}", file=sys.stderr, flush=True)
+
+
+def peer_uid(sock):
+    try:
+        raw = sock.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
+        )
+        return struct.unpack("3i", raw)[1]
+    except OSError:
+        return None
+
+
+class Client:
+    def __init__(self, sock):
+        self.sock = sock
+        self.buffer = b""
+
+
+class FakeHardware:
+    """Simulated hardware for GUI development and tests."""
+
+    backend = "fake"
+
+    def __init__(self):
+        self.state = {
+            "fans": {fan: {"mode": "auto", "percent": 50} for fan in core.FANS},
+            "coolboost": False,
+        }
+        self._tick = 0
+
+    def capabilities(self):
+        return {"fan_control": True, "fan_rpm": True, "coolboost": True}
+
+    def set_fan(self, fan, mode, percent=None):
+        self.state["fans"][fan] = {
+            "mode": mode,
+            "percent": core.clamp_percent(percent if percent is not None else 50),
+        }
+
+    def set_coolboost(self, enabled):
+        self.state["coolboost"] = bool(enabled)
+
+    def read_sensors(self):
+        self._tick += 1
+        delta = self._tick % 7
+        return {
+            "cpu_temp": 52.0 + delta,
+            "gpu_temp": 45.0 + delta / 2,
+            "cpu_rpm": 2200 + delta * 40,
+            "gpu_rpm": 2100 + delta * 35,
+        }
+
+    def restore_auto(self):
+        for fan in core.FANS:
+            self.state["fans"][fan] = {"mode": "auto", "percent": 50}
+        self.state["coolboost"] = False
+
+
+class Helper:
+    def __init__(self, socket_path, allowed_uid, fake=False):
+        self.socket_path = socket_path
+        self.allowed_uid = allowed_uid
+        self.server = None
+        self.clients = []
+        self.state = None
+        self.hw = None
+        self.fault = None
+        self.last_status = None
+        self.next_tick = 0.0
+        self.running = True
+
+        if fake:
+            self.hw = FakeHardware()
+            log("using simulated hardware")
+        elif not core.model_supported():
+            self.fault = (
+                "unsupported model: "
+                + (core.read_text("/sys/class/dmi/id/product_name", "unknown") or "unknown")
+            )
+            log(self.fault)
+        else:
+            for message in core.ensure_modules():
+                log(message)
+            try:
+                self.hw = core.Hardware()
+                self.hw.restore_auto()
+                log(f"fan backend: {self.hw.backend}")
+            except (core.HardwareError, OSError) as exc:
+                self.fault = str(exc)
+                log(self.fault)
+
+    # ---- status -------------------------------------------------------
+    def status_payload(self):
+        sensors = self.hw.read_sensors() if self.hw else {}
+        state = self.state or {
+            "fans": {fan: {"mode": "auto", "percent": 50} for fan in core.FANS},
+            "coolboost": False,
+        }
+        return {
+            "type": "status",
+            "ready": True,
+            "backend": self.hw.backend if self.hw else None,
+            "capabilities": self.hw.capabilities() if self.hw else {},
+            "fans": state["fans"],
+            "coolboost": state["coolboost"],
+            "temps": {
+                "cpu": sensors.get("cpu_temp"),
+                "gpu": sensors.get("gpu_temp"),
+            },
+            "rpm": {
+                "cpu": sensors.get("cpu_rpm"),
+                "gpu": sensors.get("gpu_rpm"),
+            },
+            "fault": self.fault,
+        }
+
+    def broadcast(self, payload):
+        if not payload:
+            return
+        self.last_status = payload
+        data = (json.dumps(payload) + "\n").encode("utf-8")
+        for client in list(self.clients):
+            try:
+                client.sock.sendall(data)
+            except OSError:
+                self.close_client(client)
+
+    # ---- control ------------------------------------------------------
+    def apply_state(self, raw):
+        if not self.hw:
+            self.broadcast(self.status_payload())
+            return
+        try:
+            config = core.normalize_config(raw)
+            for fan in core.FANS:
+                fan_config = config["fans"][fan]
+                self.hw.set_fan(fan, fan_config["mode"], fan_config["percent"])
+            self.hw.set_coolboost(config["coolboost"])
+            self.state = core.control_state(config)
+            self.fault = None
+            self.next_tick = 0.0
+        except (core.HardwareError, OSError, ValueError) as exc:
+            self.fail(str(exc))
+
+    def fail(self, message):
+        log(message)
+        self.fault = message
+        self.state = None
+        if self.hw:
+            try:
+                self.hw.restore_auto()
+            except (core.HardwareError, OSError) as exc:
+                log(f"could not restore auto mode: {exc}")
+        self.broadcast(self.status_payload())
+
+    def restore(self):
+        if self.hw:
+            try:
+                self.hw.restore_auto()
+            except (core.HardwareError, OSError) as exc:
+                log(f"could not restore auto mode: {exc}")
+        self.state = None
+
+    def tick(self):
+        if self.hw:
+            self.broadcast(self.status_payload())
+
+    # ---- socket -------------------------------------------------------
+    def setup_socket(self):
+        directory = os.path.dirname(self.socket_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        try:
+            if stat.S_ISSOCK(os.stat(self.socket_path).st_mode):
+                os.unlink(self.socket_path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            log(f"cannot remove old socket: {exc}")
+        self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.server.bind(self.socket_path)
+        os.chmod(self.socket_path, 0o660)
+        if os.geteuid() == 0:
+            try:
+                gid = pwd.getpwuid(self.allowed_uid).pw_gid
+                os.chown(self.socket_path, 0, gid)
+            except (KeyError, OSError) as exc:
+                log(f"could not set socket group: {exc}")
+        self.server.listen(4)
+
+    def accept_client(self):
+        try:
+            sock, _ = self.server.accept()
+        except OSError:
+            return
+        uid = peer_uid(sock)
+        if uid != self.allowed_uid:
+            log(f"rejected client uid={uid}")
+            sock.close()
+            return
+        sock.setblocking(False)
+        client = Client(sock)
+        self.clients.append(client)
+        log(f"GUI connected (uid={uid})")
+        payload = self.last_status or self.status_payload()
+        data = (json.dumps(payload) + "\n").encode("utf-8")
+        try:
+            sock.sendall(data)
+        except OSError:
+            self.close_client(client)
+
+    def close_client(self, client):
+        if client in self.clients:
+            self.clients.remove(client)
+        try:
+            client.sock.close()
+        except OSError:
+            pass
+        if not self.clients:
+            self.on_last_disconnect()
+
+    def on_last_disconnect(self):
+        if self.state is not None:
+            log("GUI disconnected; restoring auto mode")
+        self.restore()
+        self.last_status = None
+
+    def handle_command(self, payload):
+        command = payload.get("cmd")
+        if command == "state":
+            self.apply_state(payload.get("state", {}))
+        elif command == "release":
+            self.restore()
+            self.broadcast(self.status_payload())
+        else:
+            log(f"unknown command: {command!r}")
+
+    def read_client(self, client):
+        try:
+            data = client.sock.recv(65536)
+        except OSError:
+            self.close_client(client)
+            return
+        if not data:
+            self.close_client(client)
+            return
+        client.buffer += data
+        while b"\n" in client.buffer:
+            line, client.buffer = client.buffer.split(b"\n", 1)
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line)
+            except (ValueError, TypeError):
+                log("ignored malformed command")
+                continue
+            self.handle_command(payload)
+
+    # ---- lifecycle ----------------------------------------------------
+    def stop(self, *_args):
+        self.running = False
+
+    def run(self):
+        self.setup_socket()
+        log(f"listening on {self.socket_path}")
+        try:
+            while self.running:
+                now = time.monotonic()
+                timeout = max(0.0, min(1.0, self.next_tick - now))
+                try:
+                    readable, _, _ = select.select(
+                        [self.server] + [client.sock for client in self.clients],
+                        [], [], timeout,
+                    )
+                except (OSError, ValueError):
+                    break
+                for sock in readable:
+                    if sock is self.server:
+                        self.accept_client()
+                    else:
+                        for client in list(self.clients):
+                            if client.sock is sock:
+                                self.read_client(client)
+                                break
+                now = time.monotonic()
+                if now >= self.next_tick:
+                    self.tick()
+                    self.next_tick = time.monotonic() + core.POLL_SECONDS
+        finally:
+            self.restore()
+            for client in list(self.clients):
+                try:
+                    client.sock.close()
+                except OSError:
+                    pass
+            if self.server:
+                try:
+                    self.server.close()
+                except OSError:
+                    pass
+            try:
+                os.unlink(self.socket_path)
+            except OSError:
+                pass
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Predator Fan Manager helper")
+    parser.add_argument("--socket", default=core.SOCKET_PATH)
+    parser.add_argument("--uid", type=int, default=os.getuid())
+    parser.add_argument("--fake", action="store_true", help=argparse.SUPPRESS)
+    args = parser.parse_args()
+
+    helper = Helper(args.socket, args.uid, fake=args.fake)
+    signal.signal(signal.SIGTERM, helper.stop)
+    signal.signal(signal.SIGINT, helper.stop)
+    helper.run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

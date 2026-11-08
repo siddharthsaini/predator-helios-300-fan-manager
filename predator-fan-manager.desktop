@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Predator Fan Manager
+Comment=CPU/GPU fan control for the Acer Predator Helios 300 PH315-51
+Exec=/usr/local/bin/predator-fan-manager --show
+Icon=utilities-system-monitor
+Terminal=false
+Categories=System;Settings;HardwareSettings;
+X-GNOME-Autostart-enabled=true
