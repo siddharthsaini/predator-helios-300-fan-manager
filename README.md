@@ -15,7 +15,16 @@ The default sensor thresholds are green below 70°C, yellow from 70°C to below
 
 ## Screenshot
 
-<img src="utility.png" alt="utility running" width="50%" style="vertical-align: middle;"><img src="top-bar.png" alt="minified top bar icon" width="50%" style="vertical-align: middle;">
+<table>
+  <tr>
+    <td style="vertical-align: top;">
+      <img src="utility.png" alt="utility running" width="100%">
+    </td>
+    <td style="vertical-align: top;">
+      <img src="top-bar.png" alt="minified top bar icon" width="100%">
+    </td>
+  </tr>
+</table>
 
 ## Important hardware warning
 
